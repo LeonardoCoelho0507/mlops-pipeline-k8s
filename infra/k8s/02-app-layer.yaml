@@ -1,0 +1,142 @@
+# ---------------------------------------------------------
+# MLflow Tracking Server
+# ---------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: mlops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      initContainers:
+        - name: create-container
+          image: mcr.microsoft.com/azure-cli:latest
+          env:
+            - name: AZURE_STORAGE_CONNECTION_STRING
+              value: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+          command:
+            - /bin/sh
+            - -c
+            - "sleep 5; az storage container create -n mlflow-artifacts || true"
+      containers:
+        - name: mlflow
+          image: mlflow-custom:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AZURE_STORAGE_CONNECTION_STRING
+              value: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+            - name: AZURE_STORAGE_REST_CLIENT_OAUTH_SKIP_API_VERSION_CHECK
+              value: "true"
+          command:
+            - mlflow
+            - server
+            - --backend-store-uri
+            - postgresql://mlflow_user:mlflow_password@postgres:5432/mlflow_db
+            - --default-artifact-root
+            - wasbs://mlflow-artifacts@devstoreaccount1.blob.core.windows.net/
+            - --artifacts-destination
+            - wasbs://mlflow-artifacts@devstoreaccount1.blob.core.windows.net/
+            - --serve-artifacts
+            - --host
+            - 0.0.0.0
+            - --allowed-hosts
+            - mlflow:5000,mlflow,localhost,localhost:5000
+          ports:
+            - containerPort: 5000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlops
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - protocol: TCP
+      port: 5000
+      targetPort: 5000
+---
+# ---------------------------------------------------------
+# FastAPI Inference Service & Auto-Scaling (HPA)
+# ---------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-api
+  namespace: mlops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-api
+  template:
+    metadata:
+      labels:
+        app: inference-api
+    spec:
+      containers:
+        - name: api
+          image: inference-api:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow:5000"
+            - name: MODEL_RUN_ID
+              value: "1fd758b4df44483ebb8ec88151e34405"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-api
+  namespace: mlops
+spec:
+  selector:
+    app: inference-api
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-api-hpa
+  namespace: mlops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-api
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
